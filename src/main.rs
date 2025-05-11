@@ -30,6 +30,7 @@ impl Plugin for NuPluginDbus {
             Box::new(commands::GetAll),
             Box::new(commands::Set),
             Box::new(commands::List),
+            Box::new(commands::Wait),
         ]
     }
 }

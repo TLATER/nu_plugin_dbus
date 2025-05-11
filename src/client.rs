@@ -1,6 +1,13 @@
+use std::{
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
+
 use dbus::{
     arg::messageitem::MessageItem,
+    blocking::{BlockingSender, SyncConnection},
     channel::{BusType, Channel},
+    message::MatchRule,
     Message,
 };
 use nu_protocol::{LabeledError, Spanned, Value};
@@ -16,7 +23,7 @@ use crate::{
 /// Executes D-Bus actions on a connection, handling nushell types
 pub struct DbusClient {
     config: DbusClientConfig,
-    conn: Channel,
+    conn: SyncConnection,
 }
 
 // Convenience macros for error handling
@@ -48,7 +55,7 @@ impl DbusClient {
         })?;
         Ok(DbusClient {
             config,
-            conn: channel,
+            conn: SyncConnection::from(channel),
         })
     }
 
@@ -395,5 +402,62 @@ impl DbusClient {
                     names
                 }
             })
+    }
+
+    pub fn wait(
+        &self,
+        sender: &Spanned<String>,
+        object: &Spanned<String>,
+        interface: &Spanned<String>,
+        signal: &Spanned<String>,
+    ) -> Result<Value, LabeledError> {
+        let span = self.config.span;
+        let valid_sender = validate_with!(dbus::strings::BusName, sender)?;
+        let valid_object = validate_with!(dbus::strings::Path, object)?;
+        let valid_interface = validate_with!(dbus::strings::Interface, interface)?;
+        let valid_signal = validate_with!(dbus::strings::Member, signal)?;
+
+        let result = Arc::new(OnceLock::new());
+        let result2 = Arc::clone(&result);
+
+        let rule = MatchRule::new_signal(valid_interface, valid_signal)
+            .with_sender(valid_sender)
+            .with_path(valid_object);
+
+        self.conn
+            .add_match(rule, move |_: (), _, message| {
+                result2
+                    .set(crate::convert::from_message(message, span))
+                    .expect("the result should not be written to from other threads");
+                false // Remove the match
+            })
+            .map_err(|err| self.error(err, "while waiting for a D-Bus signal"))?;
+
+        // Since `.process` happens on this thread, and cannot sleep
+        // indefinitely, we sadly in turn cannot sleep indefinitely,
+        // and so cannot just use a condvar to pick up when we've
+        // received a signal.
+
+        // TODO(tlater): Accept the global timeout config, but make
+        // its default value mean "no timeout" in this context, and
+        // think of how to document that in a way that is not
+        // confusing.
+        while result.get().is_none() {
+            // TODO(tlater): Figure out why we don't receive keyboard
+            // interrupts despite the generously small polling
+            // interval here.
+            self.conn
+                .process(Duration::from_secs(2))
+                .map_err(|err| self.error(err, "while waiting for a D-Bus signal"))?;
+        }
+
+        // We need to clone because rust cannot assert at compile time
+        // that the OnceCell will not be written to again. The actual
+        // overhead is too small to warrant unsafe here.
+        OnceLock::clone(&result)
+            .into_inner()
+            .expect("already asserted that the value has been set")
+            .map_err(|err| self.error(err, "while receiving a D-Bus signal"))
+            .map(|val| val.into_iter().nth(0).unwrap_or_default())
     }
 }
